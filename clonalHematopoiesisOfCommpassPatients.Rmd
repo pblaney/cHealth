@@ -1,0 +1,1561 @@
+---
+title: "Clonal Hematopoiesis of CoMMpass Patients"
+author: "Patrick Blaney"
+date: "11/29/2019"
+output: html_document
+---
+
+Prep the project workspace
+```{r workspace-prep, message=FALSE, results='hide'}
+# Load in required libraries
+library(tidyverse)
+library(ggpubr)
+library(rlist)
+library(spatstat.utils)
+library(g3viz)
+library(boot)
+
+# Set figure base theme
+theme_set(
+  theme_gray() +
+  theme(axis.line = element_line(size = 0.5,  color = "black"),
+        panel.background = element_rect(fill = NA, size = rel(14)),
+        panel.grid.minor = element_line(color = NA),
+        axis.text = element_text(size = 12,  color = "black"),
+        axis.title = element_text(size = 14),
+        axis.ticks = element_line(size = 0.75),
+        title = element_text(size = 16)
+        )
+  )
+```
+
+Stage for linking variables to input files
+```{r}
+mmrfSraRunTable <- "data/sraRunTablePhs000748.csv"
+mmrfPatientAges <- "data/mmrfPatientAges.csv"
+qualityMetricsTable <- "data/qcMetricsSummary.csv"
+gatkVcf <- "data/VCF-GATK-HC-annot.all.merged.txt"
+lofreqVcf <- "data/VCF-LoFreq-annot.all.merged.txt"
+```
+
+Read in patient metadata
+```{r patient-metadata, message=FALSE}
+patientId <- read_delim(file = mmrfSraRunTable, delim = ",") %>%
+  filter(`Assay Type` == "WXS" & is_tumor == "No") %>%
+  select(acc, submitted_subject_id, sex)
+
+patientId$submitted_subject_id <- patientId$submitted_subject_id %>%
+  str_replace("_", "")
+
+patientAge <- read_csv(file = mmrfPatientAges)
+```
+
+Read in the quality metrics file, visualize the distribution with a boxplot, and determine the outlier
+samples based on being outside the lower or upper whisker
+```{r quality-metrics, message=FALSE}
+qualityMetrics <- read_csv(file = qualityMetricsTable,
+                           col_names = TRUE
+                           )
+
+# Remove samples that have missing values for mean coverage
+qualityMetrics = qualityMetrics[-c(which(qualityMetrics$`MEAN COVERAGE` == "X")),]
+
+# Boxplot of the mean coverage for all samples with lables of lower and upper whisker and median
+ggplot(qualityMetrics, aes(y = as.numeric(`MEAN COVERAGE`))) +
+  geom_boxplot(outlier.alpha = 0.7, width = 0.05, fill = "chocolate1") +
+  geom_hline(yintercept = 20, color = "red", linetype = "dashed", size = 0.75) +
+  stat_boxplot(geom = "errorbar", width = 0.03) +
+  xlim(c(-0.1, 0.1)) +
+  labs(title = "Whole Exome Sample Alignment Coverage",
+       x = "Samples",
+       y = "Mean Coverage"
+       ) +
+  annotate(geom = "text",
+           x = 0.04,
+           y = boxplot.stats(as.numeric(qualityMetrics$`MEAN COVERAGE`))$stats[c(1,3,5)],
+           label = boxplot.stats(as.numeric(qualityMetrics$`MEAN COVERAGE`))$stats[c(1,3,5)]
+           ) +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        plot.title = element_text(hjust = 0.5)
+        )
+
+# Get list of samples that fall into outlier status of mean coverage
+outlierCoverageSamples <- qualityMetrics %>%
+  filter(as.numeric(`MEAN COVERAGE`) < boxplot.stats(as.numeric(qualityMetrics$`MEAN COVERAGE`))$stats[1] |
+         as.numeric(`MEAN COVERAGE`) > boxplot.stats(as.numeric(qualityMetrics$`MEAN COVERAGE`))$stats[5]) %>%
+  select(`#SAMPLE`, `MEAN COVERAGE`)
+```
+
+Subset the patient metadata and quality metrics to only the samples that will be kept for all downstream
+analysis
+```{r metadata-cleaning, message=FALSE}
+# Remove all the samples that have a mean coverage below 20.00 as determined by the outlier coverage
+qualityMetrics <- qualityMetrics[as.numeric(qualityMetrics$`MEAN COVERAGE`) > 20.00,]
+
+# Only keep patient ID metadata for samples left for whole downstream analysis
+patientId <- patientId[patientId$acc %in% qualityMetrics$`#SAMPLE`,]
+
+# Only keep patient age metadata for samples left for whole downstream analysis
+patientAge <- patientAge[patientAge$patient_id %in% patientId$submitted_subject_id,]
+```
+
+Visualize the distribution of age of all the samples and generate mean and range
+```{r viz-age-distribution}
+meanAge <- round(mean(patientAge$age), digits = 0)
+
+ggplot(patientAge, aes(x = age)) +
+  geom_histogram(breaks = seq(27, 97, 5), color = "black", fill = "dodgerblue") +
+  geom_vline(xintercept = meanAge, color = "red", linetype = "dashed", size = 0.75) +
+  labs(title = "Age Distribution",
+       x = "Age (Bin = 5 years)",
+       y = "Number of Samples") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_x_continuous(breaks = seq(22, 98, 5)) +
+  scale_y_continuous(expand = c(0,0))
+```
+
+Read in VCF files
+```{r input-VCFs, message=FALSE, warning=FALSE}
+# GATK VCF file
+gatkVariantCalls <- read_delim(file = gatkVcf,
+                               delim = "\t",
+                               col_names = TRUE,
+                               num_threads = 2,
+                               progress = T 
+                               )
+
+# Rename column 1 to make it easier to interact with in data frame
+vcfColumns <- colnames(gatkVariantCalls)
+vcfColumns[1] <- "MUT"
+colnames(gatkVariantCalls) <- vcfColumns
+
+# Find and remove the extra header rows from concatinating the VCF files together
+gatkVariantCalls <- gatkVariantCalls[-which(gatkVariantCalls$MUT == "#MUT"),]
+
+# LoFreq VCF file 
+lofreqVariantCalls <- read_delim(file = lofreqVcf,
+                                 delim = "\t",
+                                 col_names = TRUE
+                                 )
+
+# Rename column 1 to make it easier to interact with in data frame
+colnames(lofreqVariantCalls) <- vcfColumns
+
+# Find and remove the extra header rows from concatinating the VCF files together
+lofreqVariantCalls <- lofreqVariantCalls[-which(lofreqVariantCalls$MUT == "#MUT"),]
+```
+
+Subset calls to remove the samples that had outlier status based on mean coverage
+```{r coverage-subset}
+# Isolate samples that have mean coverage below 20
+samplesToRemove <- outlierCoverageSamples %>%
+  filter(as.numeric(`MEAN COVERAGE`) < 20.00) %>%
+  select(`#SAMPLE`)
+
+# Remove any calls for the samples with below 20 mean coverage
+gatkVariantCalls <- gatkVariantCalls %>%
+  filter(!SAMPLE %in% samplesToRemove$`#SAMPLE`)
+
+lofreqVariantCalls <- lofreqVariantCalls %>%
+  filter(!SAMPLE %in% samplesToRemove$`#SAMPLE`)
+```
+
+Subset all calls to only hits in regions: exonic, splicing, and exonic;splicing
+```{r regions-subset}
+gatkVariantCalls <- gatkVariantCalls %>%
+  filter(Func.refGene %in% c("exonic",
+                             "splicing",
+                             "exonic;splicing"
+                            )
+         )
+
+lofreqVariantCalls <- lofreqVariantCalls %>%
+  filter(Func.refGene %in% c("exonic",
+                             "splicing",
+                             "exonic;splicing"
+                            )
+         )
+```
+
+Filter out calls with a QUAL score below 90, mutation types, and bad calls based on extreme VAFs 
+```{r additional-filters}
+# GATK
+# QUAL filter
+gatkVariantCalls <- gatkVariantCalls %>%
+  filter(as.numeric(QUAL) > 90)
+
+# Mutation type fiter
+gatkVariantCalls <- gatkVariantCalls %>%
+  filter(ExonicFunc.refGene %in% c("frameshift insertion", "frameshift deletion",
+                                   "stopgain", "stoploss", "nonsynonymous SNV")
+         )
+
+# Remove calls with a VAF above 1 and below 0.01
+gatkVariantCalls <- gatkVariantCalls %>%
+  filter(FREQ < 1.0 & FREQ > 0.01)
+
+
+# LoFreq
+# QUAL filter
+lofreqVariantCalls <- lofreqVariantCalls %>%
+  filter(as.numeric(QUAL) > 90)
+
+# Mutation type fiter
+lofreqVariantCalls <- lofreqVariantCalls %>%
+  filter(ExonicFunc.refGene %in% c("frameshift insertion", "frameshift deletion",
+                                   "stopgain", "stoploss", "nonsynonymous SNV")
+         )
+
+# Remove calls with a VAF above 1 and below 0.01
+lofreqVariantCalls <- lofreqVariantCalls %>%
+  filter(FREQ < 1.0 & FREQ > 0.01)
+```
+
+Visualize the distribution of all variants by VAF
+```{r vaf-viz}
+# LoFreq VAF Distribution
+ggplot(lofreqVariantCalls) +
+  geom_histogram(aes(x = FREQ), binwidth = 0.01, color = "black", fill = "darkolivegreen4", boundary = TRUE) +
+  geom_vline(xintercept = median(lofreqVariantCalls$FREQ), color = "red", linetype = "dashed", size = 0.75) +
+  labs(title = "LoFreq VAF Distribution",
+       x = "Variant Allele Frequency",
+       y = "Number of Variants"
+       ) +
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  scale_y_continuous(expand = c(0,0))
+```
+
+Expectation is that somatic mutations will only be present in a subset of patients and, furthermore,
+only a subset of cells within the sample. Therefore, the prediction for these mutations would be in
+less than 50% of reads.
+Filter out all calls with a VAF above 0.50
+```{r vaf50-filter}
+# GATK filter
+gatkVariantCalls <- gatkVariantCalls %>%
+  filter(FREQ < 0.50)
+
+# LoFreq filter
+lofreqVariantCalls <- lofreqVariantCalls %>%
+  filter(FREQ < 0.50)
+
+# Write current filtered calls to file that will be processed with additional 1000 Genome Project filters
+#write_delim(x = lofreqVariantCalls,
+#            path = "../data/variantCalls.basefilter.txt",
+#            delim = "\t",
+#            col_names = TRUE)
+
+# Revisualize the distribution
+ggplot(lofreqVariantCalls) +
+  geom_histogram(aes(x = FREQ), binwidth = 0.01, color = "black", fill = "darkolivegreen4", boundary = TRUE) +
+  labs(title = "LoFreq VAF Distribution",
+       x = "Variant Allele Frequency",
+       y = "Number of Variants"
+       ) +
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  scale_y_continuous(expand = c(0,0))
+```
+
+To reduce FPR of variant calls, run through series of filters based on genomic regions defined by 1000
+Genome Project (as listed in Genovese et al. NEJM 2014)
+Low-Complexity Region filter
+```{r LCR-filter, message=FALSE, warning=FALSE}
+# Low-Complexity Region filter
+lcrVariantCalls <- read_delim(file = "../data/variantCalls.lcrfilter.txt",
+                              delim = "\t",
+                              col_names = TRUE
+                              )
+
+# Find and remove the extra header rows from concatinating the VCF files together
+#lcrVariantCalls <- lcrVariantCalls[-which(lcrVariantCalls$MUT == "MUT"),]
+
+# Rewrite the variant call file with the extra header lines removed
+#write_delim(x = lcrVariantCalls,
+#            path = "../data/variantCalls.lcrfilter.txt",
+#            delim = "\t",
+#            col_names = TRUE)
+
+# Create list of all calls removed by the LCR filter
+filteredOutLcr <- setdiff(lofreqVariantCalls, lcrVariantCalls)
+```
+
+Hardy-Weinberg filter
+```{r HW-filter, message=FALSE, warning=FALSE}
+# Hardy-Weinberg filter
+hwVariantCalls <- read_delim(file = "../data/variantCalls.hwfilter.txt",
+                             delim = "\t",
+                             col_names = TRUE
+                             )
+
+# Find and remove the extra header rows from concatinating the VCF files together
+#hwVariantCalls <- hwVariantCalls[-which(hwVariantCalls$MUT == "MUT"),]
+
+# Rewrite the variant call file with the extra header lines removed
+#write_delim(x = hwVariantCalls,
+#            path = "../data/variantCalls.hwfilter.txt",
+#            delim = "\t",
+#            col_names = TRUE)
+
+# Create list of all calls removed by the HW filter
+filteredOutHw <- setdiff(lcrVariantCalls, hwVariantCalls)
+```
+
+Excess Coverage filter
+```{r EC-filter, message=FALSE, warning=FALSE}
+# Excess Coverage filter
+ecVariantCalls <- read_delim(file = "../data/variantCalls.ecfilter.txt",
+                            delim = "\t",
+                            col_names = TRUE
+                            )
+
+# Find and remove the extra header rows from concatinating the VCF files together
+#ecVariantCalls <- ecVariantCalls[-which(ecVariantCalls$MUT == "MUT"),]
+
+# Rewrite the variant call file with the extra header lines removed
+#write_delim(x = ecVariantCalls,
+#            path = "../data/variantCalls.ecfilter.txt",
+#            delim = "\t",
+#            col_names = TRUE)
+
+# Create list of all calls removed by the EC filter
+filteredOutEc <- setdiff(hwVariantCalls, ecVariantCalls)
+```
+
+Segmental Duplication filter
+```{r SD-filter, message=FALSE, warning=FALSE}
+# Segmental Duplication filter
+sdVariantCalls <- read_delim(file = "../data/variantCalls.sdfilter.txt",
+                             delim = "\t",
+                             col_names = TRUE
+                             )
+
+# Find and remove the extra header rows from concatinating the VCF files together
+#sdVariantCalls <- sdVariantCalls[-which(sdVariantCalls$MUT == "MUT"),]
+
+# Rewrite the variant call file with the extra header lines removed
+#write_delim(x = sdVariantCalls,
+#            path = "../data/variantCalls.sdfilter.txt",
+#            delim = "\t",
+#            col_names = TRUE)
+
+# Create list of all calls removed by the SD filter
+filteredOutSd <- setdiff(ecVariantCalls, sdVariantCalls)
+```
+
+Strict Mask filter
+```{r SM-filter, message=FALSE, warning=FALSE}
+# Strict Mask filter
+smVariantCalls <- read_delim(file = "../data/variantCalls.smfilter.txt",
+                             delim = "\t",
+                             col_names = TRUE
+                             )
+
+# Find and remove the extra header rows from concatinating the VCF files together
+#smVariantCalls <- smVariantCalls[-which(smVariantCalls$MUT == "MUT"),]
+
+# Rewrite the variant call file with the extra header lines removed
+#write_delim(x = smVariantCalls,
+#            path = "../data/variantCalls.smfilter.txt",
+#            delim = "\t",
+#            col_names = TRUE)
+
+# Create list of all calls removed by the SM filter
+filteredOutSm <- setdiff(sdVariantCalls, smVariantCalls)
+```
+
+Revisualize the distribution of all variants by VAF after all hard filtering
+```{r post-filter-vaf-viz}
+# Total VAF Distribution
+ggplot(smVariantCalls) +
+  geom_histogram(aes(x = FREQ), binwidth = 0.01, color = "black", fill = "darksalmon", boundary = TRUE) +
+  geom_vline(xintercept = quantile(smVariantCalls$FREQ, probs = seq(0,1,0.05))[c(4,6,11,16)],
+             color = "red",
+             linetype = "dashed",
+             size = 0.75) +
+  labs(title = "Post-Filter Total VAF Distribution",
+       x = "Variant Allele Frequency",
+       y = "Number of Variants"
+       ) +
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  scale_y_continuous(expand = c(0,0)) +
+  annotate(geom = "text",
+           x = quantile(smVariantCalls$FREQ, probs = seq(0,1,0.05))[c(4,6,11,16)] - 0.015,
+           y = c(380000, 400000, 380000, 400000),
+           label = c("15%", "25%", "50%", "75%")
+           )
+```
+
+Determine which mutations are considered putative somatic mutations based on the following criteria:
+1. SNP
+2. Observed once in the series (corresponds to a MAF of 5% or 0.05)
+3. VAF between 10% - 30%
+```{r putative-somatic-mutations}
+# Separate into SNVs and stopgain/stoploss calls and subset to calls with VAF > 10%
+putativeSnvs <- smVariantCalls %>%
+  filter(ExonicFunc.refGene == "nonsynonymous SNV" & FREQ > 0.10 & FREQ < 0.30)
+putativeStopGainLoss <- smVariantCalls %>%
+  filter(ExonicFunc.refGene %in% c("stoploss", "stopgain") & FREQ > 0.10 & FREQ < 0.30)
+
+# Remove any stopgain/stoploss that is not a single nucleotide change
+stopGainLossToKeep <- rep(NA, nrow(putativeStopGainLoss))
+for(i in 1:nrow(putativeStopGainLoss)) {
+  ref <- str_count(putativeStopGainLoss$Ref[i])
+  alt <- str_count(putativeStopGainLoss$Alt[i])
+  if(ref == 1 & alt == 1) {
+    stopGainLossToKeep[i] <- TRUE
+  } else {
+    stopGainLossToKeep[i] <- FALSE
+  }
+}
+putativeStopGainLoss <- putativeStopGainLoss[stopGainLossToKeep,]
+
+# Add the SNP stopgain/stoploss mutations with the SNVs 
+putativeSomaticMutations <- rbind(putativeSnvs, putativeStopGainLoss)
+
+# Determine which mutations only occur once in the series of patients
+potentialPutativeMuts <- unique(putativeSomaticMutations$MUT)
+putativeMutsToKeep <- rep(NA, length(potentialPutativeMuts))
+for(i in 1:length(potentialPutativeMuts)) {
+  if(sum(putativeSomaticMutations$MUT == potentialPutativeMuts[i]) == 1) {
+    putativeMutsToKeep[i] <- TRUE
+  } else {
+    putativeMutsToKeep[i] <- FALSE
+  }
+}
+potentialPutativeMuts <- potentialPutativeMuts[putativeMutsToKeep]
+
+# Filter out any mutation that is repeated within the series of patients
+putativeSomaticMutations <- putativeSomaticMutations %>%
+  filter(MUT %in% potentialPutativeMuts)
+```
+
+Determine which mutations are considered inclusive somatic mutations based on the following criteria:
+1. SNP or indel of length 1 or 2 base pairs
+2. Observed once in the series (corresponds to a MAF of 5% or 0.05)
+3. VAF between 5% - 30%
+```{r inclusive-somatic-mutations}
+# Separate into SNVs and stopgain/stoploss calls and subset to calls with VAF above 5%
+inclusiveSnvs <- smVariantCalls %>%
+  filter(ExonicFunc.refGene == "nonsynonymous SNV" & FREQ > 0.05 & FREQ < 0.30)
+inclusiveIndels <- smVariantCalls %>%
+  filter(ExonicFunc.refGene %in% c("stoploss", "stopgain", "frameshift insertion", "frameshift deletion")
+         & FREQ > 0.05 & FREQ < 0.30)
+
+# Remove any frameshift insertion/deletion or stopgain/stoploss that is not a single or double 
+# nucleotide change
+indelsToKeep <- rep(NA, nrow(inclusiveIndels))
+for(i in 1:nrow(inclusiveIndels)) {
+  ref <- str_count(inclusiveIndels$Ref[i])
+  alt <- str_count(inclusiveIndels$Alt[i])
+  if(ref < 3 & alt < 3) {
+    indelsToKeep[i] <- TRUE
+  } else {
+    indelsToKeep[i] <- FALSE
+  }
+}
+inclusiveIndels <- inclusiveIndels[indelsToKeep,]
+
+# Add the indel mutations with the SNVs 
+inclusiveSomaticMutations <- rbind(inclusiveSnvs, inclusiveIndels)
+
+# Determine which mutations only occur once in the series of patients
+potentialInclusiveMuts <- unique(inclusiveSomaticMutations$MUT)
+inclusiveMutsToKeep <- rep(NA, length(potentialInclusiveMuts))
+for(i in 1:length(potentialInclusiveMuts)) {
+  if(sum(inclusiveSomaticMutations$MUT == potentialInclusiveMuts[i]) == 1) {
+    inclusiveMutsToKeep[i] <- TRUE
+  } else {
+    inclusiveMutsToKeep[i] <- FALSE
+  }
+}
+potentialInclusiveMuts <- potentialInclusiveMuts[inclusiveMutsToKeep]
+
+# Filter out any mutation that is repeated within the series of patients
+inclusiveSomaticMutations <- inclusiveSomaticMutations %>%
+  filter(MUT %in% potentialInclusiveMuts)
+```
+
+Determine which mutations are considered candidate driver somatic mutations based on the following criteria:
+1. Disruptive and missense mutations in gene DNMT3A localized in exons 7 to 23
+2. Disruptive mutations in gene ASXL1 with exclusion of p.G646fsX12 and p.G645fsX58
+3. Disruptive mutations in gene TET2
+4. Disruptive mutations in gene PPM1D
+5. Missense mutation JAK2 p.V617F
+6. Mutations reported at least 7 times in hematopoietic and lymphoid malignancies in COSMIC
+```{r}
+dnmt3a <- smVariantCalls %>% filter(Gene.refGene == "DNMT3A")
+dnmt3a <- dnmt3a[grep("exon(7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23)", dnmt3a$AAChange.refGene),]
+
+asxl1 <- smVariantCalls %>% filter(Gene.refGene == "ASXL1" & ExonicFunc.refGene != "nonsynonymous SNV")
+if(length(grep("(p.G646fsX12|p.G645fsX58)", asxl1$AAChange.refGene))) {
+  asxl1 <- asxl1[-grep("(p.G646fsX12|p.G645fsX58)", asxl1$AAChange.refGene),]
+}
+
+tet2 <- smVariantCalls %>% filter(Gene.refGene == "TET2" & ExonicFunc.refGene != "nonsynonymous SNV")
+
+ppm1d <- smVariantCalls %>% filter(Gene.refGene == "PPM1D" & ExonicFunc.refGene != "nonsynonymous SNV")
+
+jak2 <- smVariantCalls %>% filter(Gene.refGene == "JAK2")
+jak2 <- jak2[grep("p.V617F", jak2$AAChange.refGene),]
+
+cosmic <- smVariantCalls %>% filter(cosmic88 != ".")
+cosmic <- cosmic[grep("OCCURENCE.+(7|8|9|\\d\\d)\\(haematopoietic_and_lymphoid_tissue\\)", cosmic$cosmic88),]
+cosmic <- cosmic %>%
+  filter(!cosmic$Gene.refGene %in% c("DNMT3A", "ASXL1", "TET2", "PPM1D", "JAK2"))
+
+candidateDriverMutations <- rbind(dnmt3a, asxl1, tet2, ppm1d, jak2, cosmic)
+
+# Filter to only variants with VAF below 30%
+candidateDriverMutations <- candidateDriverMutations %>%
+  filter(FREQ < 0.30)
+```
+
+Filter out any candidate driver somatic mutation that was recently flagged as a SNP in the most recent
+COSMIC release (dual check between website and cosmicMutationExport.tsv file downloaded from website)
+```{r inherited-mutation-filter}
+# Removal of AKAP13 mutation COSM4984855 as it has been flagged as a SNP in most recent COSMIC release (v91)
+candidateDriverMutations <- candidateDriverMutations %>%
+  filter(Gene.refGene != "AKAP13")
+
+# Removal of CSF3R mutation COSM6494339 as it has been flagged as a SNP in most recent COSMIC release (v91)
+candidateDriverMutations <- candidateDriverMutations %>%
+  filter(Gene.refGene != "CSF3R")
+
+# Removal of DIS3 mutation COSM5003869 as it has been flagged as a SNP in most recent COSMIC release (v91)
+candidateDriverMutations <- candidateDriverMutations %>%
+  filter(Gene.refGene != "DIS3")
+
+# Removal of ERCC2 mutation COSM3749518,COSM4132125 as it has been flagged as a SNP in most recent
+# COSMIC release (v91)
+candidateDriverMutations <- candidateDriverMutations %>%
+  filter(Gene.refGene != "ERCC2")
+
+# Removal of GLI1 mutation COSM3998896 as it has been flagged as a SNP in most recent COSMIC release (v91)
+candidateDriverMutations <- candidateDriverMutations %>%
+  filter(Gene.refGene != "GLI1")
+
+# Removal of HJURP mutation COSM4001570,COSM6494794 as it has been flagged as a SNP in most recent
+# COSMIC release (v91)
+candidateDriverMutations <- candidateDriverMutations %>%
+  filter(Gene.refGene != "HJURP")
+
+# Removal of ITGAX mutation COSM1377634 as it has been flagged as a SNP in most recent COSMIC release (v91)
+candidateDriverMutations <- candidateDriverMutations %>%
+  filter(Gene.refGene != "ITGAX")
+
+# Removal of KRTAP4-5 mutation COSM436561 as it has been flagged as a SNP in most recent COSMIC release (v91)
+candidateDriverMutations <- candidateDriverMutations %>%
+  filter(Gene.refGene != "KRTAP4-5")
+
+# Removal of NCOA7 mutation COSM4003675 as it has been flagged as a SNP in most recent COSMIC release (v91)
+candidateDriverMutations <- candidateDriverMutations %>%
+  filter(Gene.refGene != "NCOA7")
+
+# Removal of NOTCH1 mutation COSM4163567 as it has been flagged as a SNP in most recent COSMIC release (v91)
+candidateDriverMutations <- candidateDriverMutations %>%
+  filter(Gene.refGene != "NOTCH1")
+
+# Removal of SETBP1 mutation COSM4592817 as it has been flagged as a SNP in most recent COSMIC release (v91)
+candidateDriverMutations <- candidateDriverMutations %>%
+  filter(Gene.refGene != "SETBP1")
+
+# Removal of SH2B3 mutation COSM6494127 as it has been flagged as a SNP in most recent COSMIC release (v91)
+candidateDriverMutations <- candidateDriverMutations %>%
+  filter(Gene.refGene != "SH2B3")
+
+# Removal of STAG1 mutation COSM5020343 as it has been flagged as a SNP in most recent COSMIC release (v91)
+candidateDriverMutations <- candidateDriverMutations %>%
+  filter(Gene.refGene != "STAG1")
+
+# Removal of TEK mutation COSM6495288 as it has been flagged as a SNP in most recent COSMIC release (v91)
+candidateDriverMutations <- candidateDriverMutations %>%
+  filter(Gene.refGene != "TEK")
+
+# Removal of TMPRSS13 mutation COSM1746060 as it has been flagged as a SNP in most recent COSMIC release (v91)
+candidateDriverMutations <- candidateDriverMutations %>%
+  filter(Gene.refGene != "TMPRSS13")
+
+# Removal of ZNF134 mutation COSM4001015 as it has been flagged as a SNP in most recent COSMIC release (v91)
+candidateDriverMutations <- candidateDriverMutations %>%
+  filter(Gene.refGene != "ZNF134")
+
+# Removal of NT5C3A mutaiton as MMRF research gateway shows only 1 patient with SVN at this gene and 
+# COSMIC mutation does not line up with AA change
+candidateDriverMutations <- candidateDriverMutations %>%
+  filter(Gene.refGene != "NT5C3A")
+
+# Visualize genes are left as candidate drivers
+candidateDriverGenes <- candidateDriverMutations %>%
+  group_by(Gene.refGene) %>%
+  count() %>%
+  arrange(desc(n))
+
+ggplot(candidateDriverGenes, aes(x = reorder(Gene.refGene, n), y = n)) +
+  geom_col(color = "black", fill = "lightcoral") +
+  labs(x = "",
+       y = "Number of Mutations") +
+  coord_flip() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.margin = margin(t = .5, r = 1, b = 0.5, l = 0, unit = "cm")) + 
+  scale_y_continuous(breaks = seq(0,55,5), expand = c(0,0), limits = c(0,55)) +
+  annotate(geom = "text",
+           x = seq(1,nrow(candidateDriverGenes),1),
+           y = rev(candidateDriverGenes$n) + 1,
+           label = as.character(rev(candidateDriverGenes$n)),
+           size = 5
+           )
+```
+
+Remove any duplicated variants in respective subsets of somatic mutation category
+```{r remove-dup-vars}
+# Putative Somatic Mutations
+# First remove any mutations that are specific to the candidate driver mutations category
+# Then remove any mutations that are specific to the inclusive somatic mutations category
+putativeSomaticMutations <- setdiff(putativeSomaticMutations, candidateDriverMutations)
+putativeSomaticMutations <- setdiff(putativeSomaticMutations, inclusiveSomaticMutations)
+
+putativeSomaticMutations %>% group_by(Gene.refGene) %>% count() %>% arrange(desc(n))
+
+# Inclusive Somatic Mutations
+# Remove any mutations that are specific to the candidate driver mutations category
+inclusiveSomaticMutations <- setdiff(inclusiveSomaticMutations, candidateDriverMutations)
+```
+
+Visualize the distribution of all somatic mutation categories by VAF
+```{r mutation-vaf-viz}
+#  Visualize the distribution of VAF for all candidate driver somatic mutations
+ggplot(candidateDriverMutations) +
+  geom_histogram(aes(x = FREQ), binwidth = 0.01, color = "black", fill = "lightcoral", boundary = TRUE) +
+  labs(title = "Candidate Driver Mutation VAF Distribution",
+       x = "Variant Allele Frequency",
+       y = "Number of Variants"
+       ) +
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  scale_y_continuous(expand = c(0,0))
+
+# Visualize the distribution of VAF for all putative somatic mutations
+ggplot(putativeSomaticMutations) +
+  geom_histogram(aes(x = FREQ), binwidth = 0.01, color = "black", fill = "lightskyblue", boundary = TRUE) +
+  labs(title = "Putative Somatic Mutation VAF Distribution",
+       x = "Variant Allele Frequency",
+       y = "Number of Variants"
+       ) +
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  scale_y_continuous(expand = c(0,0))
+
+# Visualize the distribution of VAF for all inclusive somatic mutations
+ggplot(inclusiveSomaticMutations) +
+  geom_histogram(aes(x = FREQ), binwidth = 0.01, color = "black", fill = "mediumpurple1", boundary = TRUE) +
+  labs(title = "Inclusive Somatic Mutation VAF Distribution",
+       x = "Variant Allele Frequency",
+       y = "Number of Variants"
+       ) +
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  scale_y_continuous(expand = c(0,0))
+```
+
+Visualization of VAF vs age for driver genes (DNMT3A, ASXL1, TET2, JAK2, PPM1D, TP53)
+```{r total-variants-CD-genes-viz, warning=FALSE}
+# Function that will take a variant call set and add a column with the age for each sample
+getAge <- function(variantCalls) {
+  age <- c()
+  for(i in 1:nrow(variantCalls)) {
+    sampleAcc <- variantCalls$SAMPLE[i]
+    sampleId <- as.character(patientId[patientId$acc == sampleAcc, 2])
+    sampleAge <- as.numeric(patientAge[patientAge$patient_id == sampleId, 2])
+    age <- append(age, sampleAge)
+  }
+  variantCalls <- variantCalls %>%
+    mutate("AGE" = age)
+  return(variantCalls)
+}
+
+# Function that will extract the mutation types of each subset and generate a color scheme
+# for plotting that will give consistency to final output visualization
+generateColorScheme <- function(variantCalls) {
+  colorValues <- c()
+  mutationTypes <- unique(variantCalls$ExonicFunc.refGene)[order(unique(variantCalls$ExonicFunc.refGene))]
+  for(i in 1:length(mutationTypes)) {
+    if(mutationTypes[i] == "frameshift deletion") {
+      colorValues <- append(colorValues, "firebrick3", after = 0)
+    }
+    else if(mutationTypes[i] == "frameshift insertion") {
+      colorValues <- append(colorValues, "chartreuse2", after = 1)
+    }    
+    else if(mutationTypes[i] == "nonsynonymous SNV") {
+      colorValues <- append(colorValues, "cyan3", after = 2)
+    } 
+    else if(mutationTypes[i] == "stopgain") {
+      colorValues <- append(colorValues, "black", after = 3)
+    }     
+    else if(mutationTypes[i] == "stoploss") {
+      colorValues <- append(colorValues, "blueviolet", after = 4)
+    }
+  }
+  return(colorValues)
+}
+
+# Function that will subset the whole variant call set to grab the ages of the just the samples
+# in the subset list then add them to the subset calls as a variable, extract the mutation types
+# of each subset and generate a color scheme for plotting that will give consistency to final
+# output visualization, and fianlly create the ggplot2 object to be the final output
+plotVAFvsAgePerGene <- function(variantCalls, geneOfInterest) {
+  
+  variantCallsSubset <- variantCalls %>%
+    filter(Gene.refGene == geneOfInterest)
+  
+  ### Get and add age of sample to call subset
+  variantCallsSubset <- getAge(variantCallsSubset)
+  
+  ### Generate color scheme to be used in plotting
+  colorValues <- generateColorScheme(variantCallsSubset)
+  
+  ### Create ggplot2 object and return as output
+  vafVsAgePlot <- ggplot(data = variantCallsSubset) +
+    geom_point(aes(x = AGE, y = FREQ, color = ExonicFunc.refGene), alpha = 0.75) +
+    scale_color_manual(name = "Mutation Type", values = colorValues) +
+    ggtitle(geneOfInterest) +
+    xlab(element_blank()) +
+    xlim(c(25,95)) +
+    ylab(element_blank()) +
+    ylim(c(0.005, 1)) +
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  ### Final Output
+  return(vafVsAgePlot)
+}
+
+# Generate plots for all 16 genes of interest and combine into one large image
+geneList <- c("DNMT3A", "ASXL1",
+              "TET2", "JAK2",
+              "PPM1D", "TP53")
+
+genePlotList <- list()
+for(i in 1:length(geneList)) {
+  genePlot <- plotVAFvsAgePerGene(candidateDriverMutations, geneList[i])
+  genePlotList <- list.append(genePlotList, genePlot)
+}
+
+combinedPlots <- ggarrange(plotlist = genePlotList,
+                           common.legend = TRUE,
+                           legend = "right"
+                           )
+
+annotate_figure(combinedPlots,
+                left = "VAF",
+                bottom = "Age"
+                )
+```
+
+Visualize the count of key CD mutations per sample by age
+```{r mutations-per-sample-by-age}
+topCDGenes <- candidateDriverMutations %>%
+  filter(Gene.refGene %in% c("DNMT3A", "ASXL1", "TET2"))
+
+sampleList <- unique(topCDGenes$SAMPLE)
+mutationCounts <- c()
+age <- c()
+mutatedGene <- c()
+for(i in 1:length(sampleList)) {
+  sampleAcc <- sampleList[i]
+  sampleId <- as.character(patientId[patientId$acc == sampleAcc, 2])
+  sampleAge <- as.numeric(patientAge[patientAge$patient_id == sampleId, 2])
+  age <- append(age, sampleAge)
+  
+  mutations <- sum(topCDGenes$SAMPLE == sampleList[i])
+  mutationCounts <- append(mutationCounts, mutations)
+  
+  whichMutation <- topCDGenes %>%
+    filter(SAMPLE == sampleList[i]) %>%
+    select(Gene.refGene)
+  if(length(whichMutation$Gene.refGene) == 1) {
+    mutatedGene <- append(mutatedGene, whichMutation$Gene.refGene)
+  } else {
+    mutatedGene <- append(mutatedGene, "Multiple Genes")
+  }
+}
+
+mutationsPerSampleByAge <- tibble(sampleList, age, mutationCounts, mutatedGene)
+
+ggplot(mutationsPerSampleByAge) +
+  geom_jitter(aes(x = age, y = mutationCounts, color = mutatedGene), width = 0, height = 0.25, alpha = 0.70) +
+  labs(title = "Number of Mutations Per Patient by Age",
+       x = "Age",
+       y = "Number of Mutations"
+       ) +
+  scale_x_continuous(breaks = seq(25, 95, 5)) +
+  scale_y_continuous(breaks = seq(1, 4, 1)) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_color_manual(name = "Mutation", values = c("tomato3", "springgreen4", "black", "purple")) +
+  annotate(geom = "text",
+           x = 43,
+           y = 2.5,
+           label = paste0("n = ", n_distinct(mutationsPerSampleByAge$sampleList)),
+           size = 4.5
+           )
+```
+
+Create lollipop plot of mutations in 3 key driver genes DNMT3A, TET2, ASXL1
+```{r lollipop-viz, message=FALSE}
+createLollipopTable <- function(mutationList, gene, transcript) {
+  Hugo_Symbol <- c()
+  Protein_Change <- c()
+  Mutation_Type <- c()
+  AA_Position <- c()
+  
+  # Subset the mutation list for gene of interest
+  mutationList <- mutationList %>%
+    filter(Gene.refGene == gene)
+  
+  for(i in 1:nrow(mutationList)) {
+    Hugo_Symbol[i] <- mutationList$Gene.refGene[i]
+    Protein_Change[i] <- str_extract(mutationList$AAChange.refGene[i], sprintf("%s:.*p.(\\w+)(\\,|)", transcript))
+    Protein_Change[i] <- str_replace(Protein_Change[i], sprintf("%s:.*p.", transcript), "")
+    Protein_Change[i] <- str_replace(Protein_Change[i], "\\,", "")
+    Mutation_Type[i] <- mutationList$ExonicFunc.refGene[i]
+    AA_Position[i] <- str_extract(Protein_Change[i], "\\d+")
+  }
+  Mutation_Type <- str_replace(
+    string = Mutation_Type,
+    pattern = "nonsynonymous SNV",
+    replacement =  "Missense_Mutation"
+    )
+  Mutation_Type <- str_replace(
+    string = Mutation_Type,
+    pattern = "frameshift deletion",
+    replacement =  "Frame_Shift_Del"
+    )
+  Mutation_Type <- str_replace(
+    string = Mutation_Type,
+    pattern = "stopgain",
+    replacement =  "Nonsense_Mutation"
+    )
+  Mutation_Type <- str_replace(
+    string = Mutation_Type,
+    pattern = "frameshift insertion",
+    replacement =  "Frame_Shift_Ins"
+    )
+  mutplotTable <- as.data.frame(cbind(Hugo_Symbol, Protein_Change, Mutation_Type, AA_Position))
+  return(mutplotTable)
+}
+
+lollipopDNMT3A <- createLollipopTable(candidateDriverMutations, "DNMT3A", "NM_022552")
+lollipopTET2 <- createLollipopTable(candidateDriverMutations, "TET2", "NM_001127208")
+lollipopASXL1 <- createLollipopTable(candidateDriverMutations, "ASXL1", "NM_015338")
+
+lollipop <- rbind(lollipopDNMT3A, lollipopTET2, lollipopASXL1)
+  
+write_delim(x = lollipop, path = "../data/lollipopPlot.maf", delim = "\t")
+
+lollipopMaf <- readMAF(maf.file = "../data/lollipopPlot.maf", if.parse.aa.pos = FALSE)
+
+getLollipopPlot <- function(geneName) {
+  plotOptions <- g3Lollipop.options(
+    # Chart settings
+    chart.width = 700,
+    chart.type = "pie",
+    chart.margin = list(left = 40, right = 20, top = 15, bottom = 25),
+    chart.background = "transparent",
+    transition.time = 600,
+    # Lollipop track settings
+    lollipop.track.height = 320,
+    lollipop.track.background = "white",
+    lollipop.pop.min.size = 2,
+    lollipop.pop.max.size = 12,
+    lollipop.pop.info.limit = 5.5,
+    lollipop.pop.info.dy = "0.30em",
+    lollipop.pop.info.color = "black",
+    lollipop.line.color = "black",
+    lollipop.line.width = 1,
+    lollipop.circle.color = "wheat",
+    lollipop.circle.width = 0.5,
+    lollipop.label.ratio = 1.4,
+    lollipop.label.min.font.size = 13,
+    lollipop.color.scheme = "set1",
+    highlight.text.angle = 60,
+    # Domain annotation track settings
+    anno.height = 23,
+    anno.margin = list(top = 1, bottom = 1),
+    anno.background = "transparent",
+    anno.bar.fill = "gray",
+    anno.bar.margin = list(top = 5, bottom = 5),
+    domain.color.scheme = "category10",
+    domain.margin = list(top = 0, bottom = 0),
+    domain.text.color = "#f2f2f2",
+    domain.text.font = "normal 11px Arial",
+    # Y-axis label
+    y.axis.label = "Number of Mutations",
+    axis.label.color = "black",
+    axis.label.alignment = "middle",
+    axis.label.font = "normal 13px Arial",
+    axis.label.dy = "-1.5em",
+    y.axis.line.color = "#303030",
+    y.axis.line.width = 0.5,
+    y.axis.line.style = "line",
+    y.max.range.ratio = 1.1,
+    # Chart title settings
+    title.color = "black",
+    title.text = geneName,
+    title.font = "bold 16px Arial",
+    title.alignment = "middle",
+    # Chart legend settings
+    legend = TRUE,
+    legend.margin = list(left=35, right = 0, top = 5, bottom = 5),
+    legend.interactive = TRUE,
+    legend.title = "Mutation Classification",
+    # Brush selection tool
+    brush = TRUE,
+    brush.selection.background = "#F8F8FF",
+    brush.selection.opacity = 0.3,
+    brush.border.color = "#a9a9a9",
+    brush.border.width = 1,
+    brush.handler.color = "#303030",
+    # tooltip and zoom
+    tooltip = TRUE,
+    zoom = TRUE
+  )
+  g3Lollipop(mutation.dat = lollipopMaf,
+             gene.symbol = geneName,
+             plot.options = plotOptions)
+}
+
+getLollipopPlot("DNMT3A")
+getLollipopPlot("TET2")
+getLollipopPlot("ASXL1")
+```
+
+Visualize the percentage of total samples per age group that have a mutation in the key candidate 
+driver genes
+```{r key-CD-samples-per-age-group}
+getAgeBin <- function(ageData) {
+  ageBins <- c("50 and Younger", "51 to 70", "71 and Older")
+  binCount <- rep(0, length(ageBins))
+  ageByBin <- tibble(ageBins, binCount)
+  
+  for(i in 1:length(ageData)) {
+    queryAge <- ageData[i]
+    
+    if(inside.range(queryAge, c(min(patientAge$age),50))) {
+      ageByBin$binCount[1] <- ageByBin$binCount[1] + 1
+    }
+    else if(inside.range(queryAge, c(51,70))) {
+      ageByBin$binCount[2] <- ageByBin$binCount[2] + 1
+    }
+    else if(inside.range(queryAge, c(71,max(patientAge$age)))) {
+      ageByBin$binCount[3] <- ageByBin$binCount[3] + 1
+    }
+  }
+  return(ageByBin)
+}
+
+allSamplesAgeBinned <- getAgeBin(patientAge$age)
+topCDGenesAgeBinned <- getAgeBin(mutationsPerSampleByAge$age)
+topCDGenesvsAll <- tibble(
+  "ageBins" = topCDGenesAgeBinned$ageBins,
+  "percentageVsAll" = (topCDGenesAgeBinned$binCount / allSamplesAgeBinned$binCount) * 100
+  )
+
+ggplot(topCDGenesvsAll, aes(x = ageBins, y = percentageVsAll, group = 1)) +
+  geom_col(fill = "mediumseagreen",  color = "mediumseagreen", alpha = 0.10, width = 0.75) +
+  labs(title = "Percentage Patients With Key Candidate Driver Mutation",
+       x = "Age",
+       y = "Percent of Patients"
+       )+
+  scale_y_continuous(expand = c(0,0)) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  annotate(geom = "text",
+           x = c(1,2,3),
+           y = 1,
+           label = paste0(topCDGenesAgeBinned$binCount, " / ", allSamplesAgeBinned$binCount),
+           size = 5,
+           )
+```
+
+Visualize the percentage of total samples per age group that have a candidate driver mutation
+```{r CD-samples-per-age-group}
+# Create tibble with patient id, age, age group, and designation of CH with a candidate driver mutation
+patientId <- rename(patientId, patient_id = submitted_subject_id)
+sampleChDesignation <- full_join(patientAge, patientId, by = "patient_id")
+
+getChDesignation <- function(sampleList) {
+  designation <- c()
+  for(i in 1:length(sampleList)) {
+    if(sampleList[i] %in% unique(candidateDriverMutations$SAMPLE)) {
+      designation[i] <- 1
+    }
+    else {
+      designation[i] <- 0
+    }
+  }
+  return(designation)
+}
+
+getAgeBinPerSample <- function(ageData) {
+  ageBins <- c("50 and Younger", "51 to 70", "71 and Older")
+  ageBinPerSample <- c()
+  for(i in 1:length(ageData)) {
+    queryAge <- ageData[i]
+    
+    if(inside.range(queryAge, c(min(patientAge$age),50))) {
+      ageBinPerSample[i] <- ageBins[1]
+    }
+    else if(inside.range(queryAge, c(51,70))) {
+      ageBinPerSample[i] <- ageBins[2]
+    }
+    else if(inside.range(queryAge, c(71,max(patientAge$age)))) {
+      ageBinPerSample[i] <- ageBins[3]
+    }
+  }
+  return(ageBinPerSample)
+}
+
+sampleChDesignation <- sampleChDesignation %>%
+  mutate(ch_designation = getChDesignation(acc)) %>%
+  select(patient_id, age, ch_designation) %>%
+  mutate(ageBin = getAgeBinPerSample(age))
+
+# Bootstrapping
+# Divide into bins based on age group
+bin1 <- sampleChDesignation %>% filter(ageBin == "50 and Younger")
+bin2 <- sampleChDesignation %>% filter(ageBin  == "51 to 70")
+bin3 <- sampleChDesignation %>% filter(ageBin  == "71 and Older")
+
+# Perform the bootstrapping for each bin
+bootmean <- function(x, y) mean(x[y])
+bsBin1 <- boot(bin1$ch_designation, bootmean, R=1000, stype="i")
+bsBin2 <- boot(bin2$ch_designation, bootmean, R=1000, stype="i")
+bsBin3 <- boot(bin3$ch_designation, bootmean, R=1000, stype="i")
+
+# Make list of standard deviation 
+sdList <- c(sd(bsBin1$t),
+            sd(bsBin2$t),
+            sd(bsBin3$t)
+            )
+
+# Compute mean and standard deviation per age group
+plotData <- plyr::ddply(sampleChDesignation, "ageBin", summarize, mean = mean(ch_designation))
+plotData$sd <- sdList
+
+# Create a bar and whisker plot of proportion of patients that have CH per age group
+ggplot(plotData, aes(x = ageBin, y = mean)) +
+  geom_bar(stat = "identity", fill = "lightcoral", color = "black", width = 0.75) + 
+  geom_errorbar(aes(ymin = mean - 1.96 * sd, ymax = mean + 1.96 * sd), width = 0.2) +
+  labs(title = "Prevalence of Clonal Hematopoiesis Per Age Group",
+       x = "Age Group",
+       y = "Proportion of Patients"
+       ) +
+  scale_y_continuous(expand = c(0,0),  limits = c(0,0.26)) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  annotate(geom = "text",
+           x = c(1,2,3),
+           y = rep(0.02,3),
+           label = c("16 / 113", "101 / 650", "41 / 213"),
+           size = 6)
+
+# dot plot
+cdMutationPerPatientByAgePlot <- function(variantList) {
+  sampleList <- unique(variantList$SAMPLE)
+  mutationCounts <- c()
+  age <- c()
+  mutatedGene <- c()
+  for(i in 1:length(sampleList)) {
+    sampleAcc <- sampleList[i]
+    sampleId <- as.character(patientId[patientId$acc == sampleAcc, 2])
+    sampleAge <- as.numeric(patientAge[patientAge$patient_id == sampleId, 2])
+    age <- append(age, sampleAge)
+    
+    mutations <- sum(variantList$SAMPLE == sampleList[i])
+    mutationCounts <- append(mutationCounts, mutations)
+    
+    whichMutation <- variantList %>%
+      filter(SAMPLE == sampleList[i]) %>%
+      select(Gene.refGene)
+    if(length(intersect(whichMutation$Gene.refGene, c("DNMT3A", "ASXL1", "TET2"))) > 0) {
+      mutatedGene <- append(mutatedGene, "Key CD Gene")
+    } else {
+      mutatedGene <- append(mutatedGene, "Other CD Gene")
+    }
+  }
+  cdMutationsPerSampleByAge <- tibble(sampleList, age, mutationCounts, mutatedGene)
+  
+  ggplot(cdMutationsPerSampleByAge) +
+  geom_jitter(aes(x = age, y = mutationCounts, color = mutatedGene), width = 0, height = 0.25, alpha = 0.85) +
+  labs(title = "Candidate Driver Mutations Per Patient by Age",
+       x = "Age",
+       y = "Number of Mutations"
+       ) +
+  scale_x_continuous(breaks = seq(25, 95, 5)) +
+  scale_y_continuous(breaks = seq(1, 3, 1)) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_color_manual(name = "Mutations", values = c("lightcoral", "black")) +
+  annotate(geom = "text",
+           x = 43,
+           y = 2.5,
+           label = paste0("n = ", n_distinct(cdMutationsPerSampleByAge$sampleList)),
+           size = 6
+           )
+}
+
+cdMutationPerPatientByAgePlot(candidateDriverMutations)
+```
+
+```{r UD-samples-per-age-group}
+# Clonal Hematopoiesis with unknown drivers (Any sample with >= 3 mutations in the Putative Somatic
+# mutation list and none in the Candidate Driver mutation list)
+ch_udPotentialSamples <- unique(putativeSomaticMutations$SAMPLE)
+numOfMutationsPerSample <- rep(NA, n_distinct(ch_udPotentialSamples))
+for(i in 1:n_distinct(putativeSomaticMutations$SAMPLE)) {
+  numOfMutationsPerSample[i] <- putativeSomaticMutations %>%
+    filter(SAMPLE == ch_udPotentialSamples[i]) %>%
+    group_by(Gene.refGene) %>%
+    count() %>%
+    nrow()
+}
+ch_udPotentialSamples <- ch_udPotentialSamples[numOfMutationsPerSample > 2]
+ch_udSamples <- setdiff(ch_udPotentialSamples, unique(ch_cd$SAMPLE))
+ch_ud <- putativeSomaticMutations %>%
+  filter(SAMPLE %in% ch_udSamples)
+ch_ud <- getAge(ch_ud)
+ch_udSampleAges <- ch_ud %>%
+  select(SAMPLE, AGE) %>%
+  unique()
+ch_udAgeBins <- getAgeBin(ch_udSampleAges$AGE)
+ch_udVsAll <- tibble("ageBins" = ch_udAgeBins$ageBins,
+                     "percentageVsAll" = (ch_udAgeBins$binCount / allSamplesAgeBinned$binCount) * 100
+                     )
+
+# bar graph
+ggplot(ch_udVsAll, aes(x = ageBins, y = percentageVsAll, group = 1)) +
+  geom_col(fill = "lightskyblue",  color = "lightskyblue", alpha = 0.10) +
+  geom_line(linetype = "dashed", size = 1, color = "lightskyblue") +
+  geom_point(shape = 4, alpha = 0.85, size = 3,  color = "lightskyblue") +
+  labs(title = "Percentage Patients With Unknown Driver Mutation",
+       x = "Age",
+       y = "Percent of Patients"
+       ) +
+  scale_y_continuous(breaks = seq(0,15,5), expand = c(0,0), limits = c(0,18)) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  annotate(geom = "text",
+           x = seq(1,12, 1),
+           y = 1.25,
+           label = paste0(ch_udAgeBins$binCount, "/", allSamplesAgeBinned$binCount),
+           size = 4,
+           )
+
+# line graph
+lmDataUd <- generateLinearModelData(ch_udVsAll$percentageVsAll, ch_udSampleAges$AGE)
+
+ggplot(data = lmDataUd, aes(x = age, y = percentagePerSample, group = 1)) +
+  geom_smooth(method = "lm", color = "lightskyblue") +
+  labs(title = "Prevalence of Clonal Hematopoiesis with UD Mutations",
+       x = "Age",
+       y = "Percent of Patients"
+       ) +
+  theme(plot.title = element_text(hjust = 0.5),
+        panel.grid.major.x = element_line(color = "gray", linetype = "solid", size = 0.25)
+        )
+```
+
+
+```{r all-CH-samples-per-age-group}
+# Clonal hematopoiesis (i.e. with candidate drivers or unknown drivers)
+ch_allSamples <- c(ch_cdSamples$SAMPLE, ch_udSamples)
+ch_all <- rbind(ch_cd, ch_ud)
+chVsAll <- tibble(
+  "ageBins" = ch_udAgeBins$ageBins,
+  "percentageVsAll" = ((ch_cdAgeBins$binCount + ch_udAgeBins$binCount) / allSamplesAgeBinned$binCount) * 100
+  )
+
+# bar graph
+ggplot(chVsAll, aes(x = ageBins, y = percentageVsAll, group = 1)) +
+  geom_col(fill = "goldenrod2",  color = "goldenrod2", alpha = 0.10) +
+  geom_line(linetype = "dashed", size = 1, color = "goldenrod2") +
+  geom_point(shape = 4, alpha = 0.85, size = 3,  color = "goldenrod2") +
+  labs(title = "Percentage Patients With Clonal Hematpoiesis",
+       x = "Age",
+       y = "Percent of Patients"
+       ) +
+  scale_y_continuous(breaks = seq(0,35,5), expand = c(0,0), limits = c(0,36)) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  annotate(geom = "text",
+           x = seq(1,12, 1),
+           y = 1.25,
+           label = paste0((ch_cdAgeBins$binCount + ch_udAgeBins$binCount), "/", allSamplesAgeBinned$binCount),
+           size = 4,
+           )
+
+# line graph
+lmDataCh <- generateLinearModelData(chVsAll$percentageVsAll, c(ch_cdSamples$AGE, ch_udSampleAges$AGE))
+
+ggplot(data = lmDataCh, aes(x = age, y = percentagePerSample, group = 1)) +
+  geom_smooth(method = "lm", color = "goldenrod2") +
+  labs(title = "Prevalence of Clonal Hematopoiesis",
+       x = "Age",
+       y = "Percent of Patients"
+       ) +
+  theme(plot.title = element_text(hjust = 0.5),
+        panel.grid.major.x = element_line(color = "gray", linetype = "solid", size = 0.25)
+        )
+```
+
+Combine all graphs into one
+```{r combined-percentage-per-age-group-viz}
+# Line graph
+ggplot() +
+  geom_smooth(data = lmDataTopCDGenes,
+              aes(x = age, y = percentagePerSample), method = "lm", color = "mediumseagreen") +
+  geom_smooth(data = lmDataCd,
+              aes(x = age, y = percentagePerSample), method = "lm", color = "lightcoral") +
+  geom_smooth(data = lmDataUd,
+              aes(x = age, y = percentagePerSample), method = "lm", color = "lightskyblue") +
+  geom_smooth(data = lmDataCh,
+              aes(x = age, y = percentagePerSample), method = "lm", color = "goldenrod2") +
+  labs(title = "Prevalence of Clonal Hematopoiesis",
+       x = "Age",
+       y = "Percent of Patients"
+       ) +
+  theme(plot.title = element_text(hjust = 0.5),
+        panel.grid.major.x = element_line(color = "gray", linetype = "solid", size = 0.25)
+        )
+
+# Bar graph
+ggplot() +
+  geom_line(aes(x = topCDGenesvsAll$ageBins, y = topCDGenesvsAll$percentageVsAll, group = 1),
+            alpha = 0.8, size = 1, color = "mediumseagreen") +
+  geom_point(aes(x = topCDGenesvsAll$ageBins, y = topCDGenesvsAll$percentageVsAll, group = 1),
+             shape = 4, alpha = 0.85, size = 3,  color = "mediumseagreen") +
+  geom_line(aes(x = ch_cdVsAll$ageBins, y = ch_cdVsAll$percentageVsAll, group = 1),
+            alpha = 0.8, size = 1, color = "lightcoral") +
+  geom_point(aes(x = ch_cdVsAll$ageBins, y = ch_cdVsAll$percentageVsAll, group = 1),
+             shape = 4, alpha = 0.85, size = 3,  color = "lightcoral") +
+  geom_line(aes(x = ch_udVsAll$ageBins, y = ch_udVsAll$percentageVsAll, group = 1),
+            alpha = 0.8, size = 1, color = "lightskyblue") +
+  geom_point(aes(x = ch_udVsAll$ageBins, y = ch_udVsAll$percentageVsAll, group = 1),
+             shape = 4, alpha = 0.85, size = 3,  color = "lightskyblue") +
+  geom_line(aes(x = chVsAll$ageBins, y = chVsAll$percentageVsAll, group = 1),
+            alpha = 0.8, size = 1, color = "goldenrod2") +
+  geom_point(aes(x = chVsAll$ageBins, y = chVsAll$percentageVsAll, group = 1),
+             shape = 4, alpha = 0.85, size = 3,  color = "goldenrod2") +
+  geom_vline(xintercept = seq(1.5, 11.5,1), linetype = "dotted") +
+  labs(title = "Percentage Patients With Candidate Driver Mutation",
+       x = "Age",
+       y = "Percent of Patients"
+       ) +
+  scale_y_continuous(expand = c(0,0), limits = c(0,35)) +
+  theme(plot.title = element_text(hjust = 0.5)) + 
+  annotate(geom = "text",
+           x = seq(1,12,1),
+           y = rep(1,12),
+           label = paste0("n=", allSamplesAgeBinned$binCount))
+```
+
+```{r}
+pie(table(sampleChDesignation$ch_designation), labels = c("other", "CH-CD"))
+```
+
+```{r CH-CD-group-data}
+ids <- c()
+for(i in 1:length(ch_cd$SAMPLE)) {
+  ids[i] <- patientId[patientId$acc == ch_cd$SAMPLE[i],3]$patient_id
+}
+chData <- tibble(patient_id = ids,
+                 chrom = ch_cd$CHR,
+                 pos = ch_cd$POS,
+                 ref = ch_cd$Ref,
+                 alt = ch_cd$Alt,
+                 gene = ch_cd$Gene.refGene,
+                 depth = ch_cd$DEPTH,
+                 vaf = ch_cd$FREQ,
+                 variant_class = ch_cd$ExonicFunc.refGene
+                 )
+
+write_delim(x = chData, path = "../data/chData.txt", delim = "\t")
+```
+
+Use the GATK variant calls to confirm the presense of the same mutation per sample and generate
+a list of very high confidence calls
+```{r high-confidence-calls}
+gatkVariantCalls <- gatkVariantCalls %>%
+  filter(FREQ < 0.30 & Gene.refGene %in% c(candidateDriverGenes$Gene.refGene))
+
+highConfidenceCalls <- tibble()
+
+# Loop through all fully filtered calls 
+for(i in 1:nrow(candidateDriverMutations)) {
+  
+  # Hold each filtered call as the query
+  queryCall <- candidateDriverMutations[i,]
+  
+  # Using query call, loop through all GATK calls to check for concordance
+  for(i in 1:nrow(gatkVariantCalls)) {
+    
+    # Hold LoFreq confirmation call row as variable
+    confirmationCall <- gatkVariantCalls[i,]
+    
+    # Test if the GATK query call is confirmed in the LoFreq call set
+    if(queryCall$MUT == confirmationCall$MUT & queryCall$SAMPLE == confirmationCall$SAMPLE) {
+      
+      # Add the GATK query call to the high confidence call set if confirmed in LoFreq call set
+      highConfidenceCalls <- rbind(highConfidenceCalls, queryCall)
+    }
+  }
+}
+```
+
+
+######################################################
+STUFF DONE PREVIOUSLY, KEEP
+Visualize the percentage of total samples per age group that have a mutation in the key candidate 
+driver genes
+```{r age-group-percentage-CD-samples}
+getAgeBin2 <- function(ageData) {
+  ageBins <- c("50 and Younger", "51 to 70", "71 and Older")
+  binCount <- rep(0, length(ageBins))
+  ageByBin <- tibble(ageBins, binCount)
+  
+  for(i in 1:length(ageData)) {
+    queryAge <- ageData[i]
+    
+    if(inside.range(queryAge, c(min(patientAge$age),50))) {
+      ageByBin$binCount[1] <- ageByBin$binCount[1] + 1
+    }
+    else if(inside.range(queryAge, c(51,70))) {
+      ageByBin$binCount[2] <- ageByBin$binCount[2] + 1
+    }
+    else if(inside.range(queryAge, c(71,max(patientAge$age)))) {
+      ageByBin$binCount[3] <- ageByBin$binCount[3] + 1
+    }
+  }
+  return(ageByBin)
+}
+
+allSamplesAgeBinned2 <- getAgeBin2(patientAge$age)
+ch_cdAgeBins2 <- getAgeBin2(ch_cdSamples$AGE)
+
+ch_cdVsAll2 <- tibble(
+  "ageBins" = ch_cdAgeBins2$ageBins,
+  "percentageVsAll" = (ch_cdAgeBins2$binCount / allSamplesAgeBinned2$binCount) * 100
+  )
+
+ggplot(ch_cdVsAll2, aes(x = ageBins, y = percentageVsAll)) +
+  geom_col(fill = "lightcoral",  color = "black", alpha = 0.80, width = 0.75) +
+  labs(title = "Prevelance of Clonal Hematopoiesis with CD Mutation",
+       x = "Age",
+       y = "Percent of Patients"
+       ) +
+  scale_y_continuous(breaks = seq(0,20,5), expand = c(0,0), limits = c(0,22)) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  annotate(geom = "text",
+           x = c(1,2,3),
+           y = 1.25,
+           label = paste0(ch_cdAgeBins2$binCount, "/", allSamplesAgeBinned2$binCount),
+           size = 5,
+           )
+
+generateLinearModelData2 <- function(ageBin, percentageByBin, sampleAgeList) {
+  percentagePerSample <- c()
+  ageBinPerSample <- c()
+  for(i in 1:length(sampleAgeList)) {
+    queryAge <- sampleAgeList[i]
+    
+    if(inside.range(queryAge, c(min(patientAge$age),50))) {
+      percentagePerSample[i] <- percentageByBin[1]
+      ageBinPerSample[i] <- ageBin[1]
+    }
+    else if(inside.range(queryAge, c(51,70))) {
+      percentagePerSample[i] <- percentageByBin[2]
+      ageBinPerSample[i] <- ageBin[2]
+    }
+    else if(inside.range(queryAge, c(71,max(patientAge$age)))) {
+      percentagePerSample[i] <- percentageByBin[3]
+      ageBinPerSample[i] <- ageBin[3]
+    }
+  }
+  lmData <- tibble(age = sampleAgeList, ageBin = ageBinPerSample, percentagePerSample = percentagePerSample)
+  return(lmData)
+}
+
+lmDataCd2 <- generateLinearModelData2(ch_cdVsAll2$ageBins, ch_cdVsAll2$percentageVsAll, ch_cdSamples$AGE)
+
+
+sampleChDesignation2$ch_designation <- factor(sampleChDesignation2$ch_designation)
+```
+
+```{r}
+getChDesignation2 <- function(sampleList) {
+  designation <- c()
+  for(i in 1:length(sampleList)) {
+    if(sampleList[i] %in% ch_cd$SAMPLE) {
+      designation[i] <- 1
+    }
+    else {
+      designation[i] <- 0
+    }
+  }
+  return(designation)
+}
+
+sampleChDesignation2 <- full_join(patientAge, patientId, "patient_id")
+sampleChDesignation2 <- sampleChDesignation2 %>%
+  mutate(ch_designation = getChDesignation2(acc)) %>%
+  select(patient_id, age, ch_designation)
+
+allSamplesAgeBinned3 <- generateLinearModelData2(ch_cdAgeBins2$ageBins,
+                                                 ch_cdVsAll2$percentageVsAll,
+                                                 sampleChDesignation2$age)
+sampleChDesignation2 <- bind_cols(sampleChDesignation2, allSamplesAgeBinned3) %>%
+  select(patient_id, age, ageBin, ch_designation)
+
+# Bootstrapping
+bin1 <- sampleChDesignation2 %>% filter(ageBin == "50 and Younger")
+bin2 <- sampleChDesignation2 %>% filter(ageBin  == "51 to 70")
+bin3 <- sampleChDesignation2 %>% filter(ageBin  == "71 and Older")
+
+bootmean <- function(x, y) mean(x[y])
+bsBin1 <- boot(bin1$ch_designation, bootmean, R=1000, stype="i")
+bsBin2 <- boot(bin2$ch_designation, bootmean, R=1000, stype="i")
+bsBin3 <- boot(bin3$ch_designation, bootmean, R=1000, stype="i")
+
+sdList <- c(sd(bsBin1$t),
+            sd(bsBin2$t),
+            sd(bsBin3$t)
+            )
+
+# compute mean and sd per combination of wool & tension
+plotData <- plyr::ddply(sampleChDesignation2, "ageBin", summarize, mean = mean(ch_designation))
+plotData$sd <- sdList
+
+ggplot(plotData, aes(x = ageBin, y = mean)) +
+  geom_bar(stat = "identity", fill = "lightcoral", color = "black", width = 0.75) + 
+  geom_errorbar(aes(ymin = mean - 1.96 * sd, ymax = mean + 1.96 * sd), width = 0.2) +
+  labs(title = "Prevalence of Clonal Hematopoiesis Per Age Group",
+       x = "Age Group",
+       y = "Proportion of Patients"
+       ) +
+  scale_y_continuous(expand = c(0,0),  limits = c(0,0.26)) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+################################################################
+library(boot)
+
+MMRF <- read_delim(file = "~/Downloads/MMFR.txt", delim = "\t")
+
+# Bootstrap
+zero=subset(MMRF, MMRF$Age=="0")
+one=subset(MMRF, MMRF$Age=="1")
+two=subset(MMRF, MMRF$Age=="2")
+three=subset(MMRF, MMRF$Age=="3")
+four=subset(MMRF, MMRF$Age=="4")
+
+bootmean <- function(d, i) mean(d[i])
+bs_zero <- boot(zero$CHIP, bootmean, R=1000, stype="i")
+bs_one <- boot(one$CHIP, bootmean, R=1000, stype="i")
+bs_two <- boot(two$CHIP, bootmean, R=1000, stype="i")
+bs_three <- boot(three$CHIP, bootmean, R=1000, stype="i")
+bs_four <- boot(four$CHIP, bootmean, R=1000, stype="i")
+
+SD_list=c(sd(bs_zero$t),sd(bs_one$t),sd(bs_two$t),sd(bs_three$t),sd(bs_four$t)) 
+
+# compute mean and sd per combination of wool & tension
+df <- plyr::ddply(MMRF, "Age", summarize, Mean = mean(CHIP))
+df$SD=SD_list
+            
+ggplot(df, aes(x = Age, y = Mean)) +
+  geom_bar(stat = "identity", fill = "lightcoral", color = "black", width = 0.75) + 
+  geom_errorbar(aes(ymin = Mean - 1.96 * SD, ymax = Mean + 1.96 * SD), width = 0.2) +
+  labs(title = "Prevalence of Clonal Hematopoiesis Per Age Group",
+       x = "Age Group",
+       y = "Proportion of Patients") +
+  scale_x_continuous(breaks = seq(0,4,1), labels = c("0-49", "50-59", "60-69", "70-79", "80-93")) +
+  scale_y_continuous(expand = c(0,0), limits = c(0,0.33)) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+
+
+
+Visualize the linear model of age of patient and corresponding percentage of patients per that age group
+```{r}
+generateLinearModelData <- function(percentageByBin, sampleAgeList) {
+  percentagePerSample <- c()
+  for(i in 1:length(sampleAgeList)) {
+    queryAge <- sampleAgeList[i]
+    
+    if(inside.range(queryAge, c(27,35))) {
+      percentagePerSample[i] <- percentageByBin[1]
+    }
+    else if(inside.range(queryAge, c(36,40))) {
+      percentagePerSample[i] <- percentageByBin[2]
+    }
+    else if(inside.range(queryAge, c(41,45))) {
+      percentagePerSample[i] <- percentageByBin[3]
+    }
+    else if(inside.range(queryAge, c(46,50))) {
+      percentagePerSample[i] <- percentageByBin[4]
+    }
+    else if(inside.range(queryAge, c(51,55))) {
+      percentagePerSample[i] <- percentageByBin[5]
+    }
+    else if(inside.range(queryAge, c(56,60))) {
+      percentagePerSample[i] <- percentageByBin[6]
+    }
+    else if(inside.range(queryAge, c(61,65))) {
+      percentagePerSample[i] <- percentageByBin[7]
+    }
+    else if(inside.range(queryAge, c(66,70))) {
+      percentagePerSample[i] <- percentageByBin[8]
+    }
+    else if(inside.range(queryAge, c(71,75))) {
+      percentagePerSample[i] <- percentageByBin[9]
+    }
+    else if(inside.range(queryAge, c(76,80))) {
+      percentagePerSample[i] <- percentageByBin[10]
+    }
+    else if(inside.range(queryAge, c(81,85))) {
+      percentagePerSample[i] <- percentageByBin[11]
+    }
+    else if(inside.range(queryAge, c(86,93))) {
+      percentagePerSample[i] <- percentageByBin[12]
+    }
+  }
+  lmData <- tibble(age = sampleAgeList, percentagePerSample = percentagePerSample)
+  return(lmData)
+}
+
+lmDataTopCDGenes <- generateLinearModelData(topCDGenesvsAll$percentageVsAll, mutationsPerSampleByAge$age)
+
+ggplot(data = lmDataTopCDGenes, aes(x = age, y = percentagePerSample, group = 1)) +
+  geom_smooth(method = "lm", color = "mediumseagreen") +
+  labs(title = "Prevalence of Clonal Hematopoiesis with Key CD",
+       x = "Age",
+       y = "Percent of Patients"
+       ) +
+  theme(plot.title = element_text(hjust = 0.5),
+        panel.grid.major.x = element_line(color = "gray", linetype = "solid", size = 0.25)
+        )
+
+
+# line graph
+lmDataCd <- generateLinearModelData(ch_cdVsAll$percentageVsAll, ch_cdSamples$AGE)
+
+ggplot(data = lmDataCd, aes(x = age, y = percentagePerSample, group = 1)) +
+  geom_smooth(method = "lm", color = "lightcoral") +
+  labs(title = "Prevalence of Clonal Hematopoiesis with CD Mutations",
+       x = "Age",
+       y = "Percent of Patients"
+       ) +
+  theme(plot.title = element_text(hjust = 0.5),
+        panel.grid.major.x = element_line(color = "gray", linetype = "solid", size = 0.25)
+        )
+
+# Clonal hematopoiesis with candidate driver mutations (Any sample with at least 1 mutation in Candidate
+# Driver mutation list)
+ch_cd <- getAge(candidateDriverMutations)
+ch_cdSamples <- ch_cd %>%
+  select(SAMPLE, AGE) %>%
+  unique()
+ch_cdAgeBins <- getAgeBin(ch_cd$AGE)
+ch_cdVsAll <- tibble("ageBins" = ch_cdAgeBins$ageBins,
+                     "percentageVsAll" = (ch_cdAgeBins$binCount / allSamplesAgeBinned$binCount) * 100
+                     )
+```
