@@ -34,8 +34,6 @@ Stage for linking variables to input files
 mmrfSraRunTable <- "data/sraRunTablePhs000748.csv"
 mmrfPatientAges <- "data/mmrfPatientAges.csv"
 qualityMetricsTable <- "data/qcMetricsSummary.csv"
-lofreqVcf <- "data/VCF-LoFreq-annot.all.merged.txt.gz"
-lrcCalls <- "data/variantCalls.lcrfilter.txt.gz"
 hwCalls <- "data/variantCalls.hwfilter.txt.gz"
 ecCalls <- "data/variantCalls.ecfilter.txt.gz"
 sdCalls <- "data/variantCalls.sdfilter.txt.gz"
@@ -125,12 +123,7 @@ ggplot(patientAge, aes(x = age)) +
 Read in VCF files
 ```{r input-VCFs, message=FALSE, warning=FALSE}
 # LoFreq VCF file 
-lofreqVariantCalls <- read_delim(file = lofreqVcf,
-                                 delim = "\t",
-                                 col_names = TRUE,
-                                 num_threads = 2,
-                                 progress = T 
-                                 )
+load("data/lofreqVariantCalls.RData")
 
 # Rename column 1 to make it easier to interact with in data frame
 vcfColumns <- colnames(lofreqVariantCalls)
@@ -246,10 +239,7 @@ Genome Project (as listed in Genovese et al. NEJM 2014)
 Low-Complexity Region filter
 ```{r LCR-filter, message=FALSE, warning=FALSE}
 # Low-Complexity Region filter
-lcrVariantCalls <- read_delim(file = lrcCalls,
-                              delim = "\t",
-                              col_names = TRUE
-                              )
+load("data/lcrVariantCalls.RData")
 
 # Find and remove the extra header rows from concatinating the VCF files together
 #lcrVariantCalls <- lcrVariantCalls[-which(lcrVariantCalls$MUT == "MUT"),]
@@ -267,10 +257,7 @@ filteredOutLcr <- setdiff(lofreqVariantCalls, lcrVariantCalls)
 Hardy-Weinberg filter
 ```{r HW-filter, message=FALSE, warning=FALSE}
 # Hardy-Weinberg filter
-hwVariantCalls <- read_delim(file = hwCalls,
-                             delim = "\t",
-                             col_names = TRUE
-                             )
+load("data/hwVariantCalls.RData")
 
 # Find and remove the extra header rows from concatinating the VCF files together
 #hwVariantCalls <- hwVariantCalls[-which(hwVariantCalls$MUT == "MUT"),]
@@ -288,10 +275,7 @@ filteredOutHw <- setdiff(lcrVariantCalls, hwVariantCalls)
 Excess Coverage filter
 ```{r EC-filter, message=FALSE, warning=FALSE}
 # Excess Coverage filter
-ecVariantCalls <- read_delim(file = ecCalls,
-                            delim = "\t",
-                            col_names = TRUE
-                            )
+load("data/ecVariantCalls.RData")
 
 # Find and remove the extra header rows from concatinating the VCF files together
 #ecVariantCalls <- ecVariantCalls[-which(ecVariantCalls$MUT == "MUT"),]
@@ -309,10 +293,7 @@ filteredOutEc <- setdiff(hwVariantCalls, ecVariantCalls)
 Segmental Duplication filter
 ```{r SD-filter, message=FALSE, warning=FALSE}
 # Segmental Duplication filter
-sdVariantCalls <- read_delim(file = sdCalls,
-                             delim = "\t",
-                             col_names = TRUE
-                             )
+load("data/sdVariantCalls.RData")
 
 # Find and remove the extra header rows from concatinating the VCF files together
 #sdVariantCalls <- sdVariantCalls[-which(sdVariantCalls$MUT == "MUT"),]
@@ -330,10 +311,7 @@ filteredOutSd <- setdiff(ecVariantCalls, sdVariantCalls)
 Strict Mask filter
 ```{r SM-filter, message=FALSE, warning=FALSE}
 # Strict Mask filter
-smVariantCalls <- read_delim(file = smCalls,
-                             delim = "\t",
-                             col_names = TRUE
-                             )
+load("data/smVariantCalls.RData")
 
 # Find and remove the extra header rows from concatinating the VCF files together
 #smVariantCalls <- smVariantCalls[-which(smVariantCalls$MUT == "MUT"),]
