@@ -34,9 +34,16 @@ Stage for linking variables to input files
 mmrfSraRunTable <- "data/sraRunTablePhs000748.csv"
 mmrfPatientAges <- "data/mmrfPatientAges.csv"
 qualityMetricsTable <- "data/qcMetricsSummary.csv"
-gatkVcf <- "data/VCF-GATK-HC-annot.all.merged.txt"
-lofreqVcf <- "data/VCF-LoFreq-annot.all.merged.txt"
+lofreqVcf <- "data/VCF-LoFreq-annot.all.merged.txt.gz"
+lrcCalls <- "data/variantCalls.lcrfilter.txt.gz"
+hwCalls <- "data/variantCalls.hwfilter.txt.gz"
+ecCalls <- "data/variantCalls.ecfilter.txt.gz"
+sdCalls <- "data/variantCalls.sdfilter.txt.gz"
+smCalls <- "data/variantCalls.smfilter.txt.gz"
+lolliMafFile <- "data/lollipopPlot.maf"
 ```
+
+# Main Analysis - Prep LoFreq calls
 
 Read in patient metadata
 ```{r patient-metadata, message=FALSE}
@@ -117,29 +124,17 @@ ggplot(patientAge, aes(x = age)) +
 
 Read in VCF files
 ```{r input-VCFs, message=FALSE, warning=FALSE}
-# GATK VCF file
-gatkVariantCalls <- read_delim(file = gatkVcf,
-                               delim = "\t",
-                               col_names = TRUE,
-                               num_threads = 2,
-                               progress = T 
-                               )
-
-# Rename column 1 to make it easier to interact with in data frame
-vcfColumns <- colnames(gatkVariantCalls)
-vcfColumns[1] <- "MUT"
-colnames(gatkVariantCalls) <- vcfColumns
-
-# Find and remove the extra header rows from concatinating the VCF files together
-gatkVariantCalls <- gatkVariantCalls[-which(gatkVariantCalls$MUT == "#MUT"),]
-
 # LoFreq VCF file 
 lofreqVariantCalls <- read_delim(file = lofreqVcf,
                                  delim = "\t",
-                                 col_names = TRUE
+                                 col_names = TRUE,
+                                 num_threads = 2,
+                                 progress = T 
                                  )
 
 # Rename column 1 to make it easier to interact with in data frame
+vcfColumns <- colnames(lofreqVariantCalls)
+vcfColumns[1] <- "MUT"
 colnames(lofreqVariantCalls) <- vcfColumns
 
 # Find and remove the extra header rows from concatinating the VCF files together
@@ -154,22 +149,12 @@ samplesToRemove <- outlierCoverageSamples %>%
   select(`#SAMPLE`)
 
 # Remove any calls for the samples with below 20 mean coverage
-gatkVariantCalls <- gatkVariantCalls %>%
-  filter(!SAMPLE %in% samplesToRemove$`#SAMPLE`)
-
 lofreqVariantCalls <- lofreqVariantCalls %>%
   filter(!SAMPLE %in% samplesToRemove$`#SAMPLE`)
 ```
 
 Subset all calls to only hits in regions: exonic, splicing, and exonic;splicing
 ```{r regions-subset}
-gatkVariantCalls <- gatkVariantCalls %>%
-  filter(Func.refGene %in% c("exonic",
-                             "splicing",
-                             "exonic;splicing"
-                            )
-         )
-
 lofreqVariantCalls <- lofreqVariantCalls %>%
   filter(Func.refGene %in% c("exonic",
                              "splicing",
@@ -180,22 +165,6 @@ lofreqVariantCalls <- lofreqVariantCalls %>%
 
 Filter out calls with a QUAL score below 90, mutation types, and bad calls based on extreme VAFs 
 ```{r additional-filters}
-# GATK
-# QUAL filter
-gatkVariantCalls <- gatkVariantCalls %>%
-  filter(as.numeric(QUAL) > 90)
-
-# Mutation type fiter
-gatkVariantCalls <- gatkVariantCalls %>%
-  filter(ExonicFunc.refGene %in% c("frameshift insertion", "frameshift deletion",
-                                   "stopgain", "stoploss", "nonsynonymous SNV")
-         )
-
-# Remove calls with a VAF above 1 and below 0.01
-gatkVariantCalls <- gatkVariantCalls %>%
-  filter(FREQ < 1.0 & FREQ > 0.01)
-
-
 # LoFreq
 # QUAL filter
 lofreqVariantCalls <- lofreqVariantCalls %>%
@@ -231,17 +200,13 @@ only a subset of cells within the sample. Therefore, the prediction for these mu
 less than 50% of reads.
 Filter out all calls with a VAF above 0.50
 ```{r vaf50-filter}
-# GATK filter
-gatkVariantCalls <- gatkVariantCalls %>%
-  filter(FREQ < 0.50)
-
 # LoFreq filter
 lofreqVariantCalls <- lofreqVariantCalls %>%
   filter(FREQ < 0.50)
 
 # Write current filtered calls to file that will be processed with additional 1000 Genome Project filters
 #write_delim(x = lofreqVariantCalls,
-#            path = "../data/variantCalls.basefilter.txt",
+#            path = "data/variantCalls.basefilter.txt",
 #            delim = "\t",
 #            col_names = TRUE)
 
@@ -256,12 +221,32 @@ ggplot(lofreqVariantCalls) +
   scale_y_continuous(expand = c(0,0))
 ```
 
+
+# Main Analysis - Filter LoFreq calls based on series of masks
+
+In brief, this analysis is executed in the following fashion.
+
+1. The variant calls remaining after preparing the LoFreq calls are exported to a file
+2. These calls are then passed through a mask-based filter as described to reduce the FPR
+3. The newly filtered calls are exported to a table and the process is repeated for 4 more times
+
+Filters:
+1. Low-Complexity Region
+2. Hardy-Weinberg
+3. Excess Coverage
+4. Segmental Duplication
+5. 1000 Genomes Strict Mask
+
+Due to the size of the callsets, the filters are applied to the variants in a per chromosome fashion.
+This is wrapped in the script `apply1000GenomeFilter.sh`, and relies on the R scripts: `1000GenomeRegionVariantFilter.R` and `strictMaskFilter.R`
+The BED files for each filter is in the `filters` directory
+
 To reduce FPR of variant calls, run through series of filters based on genomic regions defined by 1000
 Genome Project (as listed in Genovese et al. NEJM 2014)
 Low-Complexity Region filter
 ```{r LCR-filter, message=FALSE, warning=FALSE}
 # Low-Complexity Region filter
-lcrVariantCalls <- read_delim(file = "../data/variantCalls.lcrfilter.txt",
+lcrVariantCalls <- read_delim(file = lrcCalls,
                               delim = "\t",
                               col_names = TRUE
                               )
@@ -282,7 +267,7 @@ filteredOutLcr <- setdiff(lofreqVariantCalls, lcrVariantCalls)
 Hardy-Weinberg filter
 ```{r HW-filter, message=FALSE, warning=FALSE}
 # Hardy-Weinberg filter
-hwVariantCalls <- read_delim(file = "../data/variantCalls.hwfilter.txt",
+hwVariantCalls <- read_delim(file = hwCalls,
                              delim = "\t",
                              col_names = TRUE
                              )
@@ -303,7 +288,7 @@ filteredOutHw <- setdiff(lcrVariantCalls, hwVariantCalls)
 Excess Coverage filter
 ```{r EC-filter, message=FALSE, warning=FALSE}
 # Excess Coverage filter
-ecVariantCalls <- read_delim(file = "../data/variantCalls.ecfilter.txt",
+ecVariantCalls <- read_delim(file = ecCalls,
                             delim = "\t",
                             col_names = TRUE
                             )
@@ -324,7 +309,7 @@ filteredOutEc <- setdiff(hwVariantCalls, ecVariantCalls)
 Segmental Duplication filter
 ```{r SD-filter, message=FALSE, warning=FALSE}
 # Segmental Duplication filter
-sdVariantCalls <- read_delim(file = "../data/variantCalls.sdfilter.txt",
+sdVariantCalls <- read_delim(file = sdCalls,
                              delim = "\t",
                              col_names = TRUE
                              )
@@ -345,7 +330,7 @@ filteredOutSd <- setdiff(ecVariantCalls, sdVariantCalls)
 Strict Mask filter
 ```{r SM-filter, message=FALSE, warning=FALSE}
 # Strict Mask filter
-smVariantCalls <- read_delim(file = "../data/variantCalls.smfilter.txt",
+smVariantCalls <- read_delim(file = smCalls,
                              delim = "\t",
                              col_names = TRUE
                              )
@@ -845,9 +830,9 @@ lollipopASXL1 <- createLollipopTable(candidateDriverMutations, "ASXL1", "NM_0153
 
 lollipop <- rbind(lollipopDNMT3A, lollipopTET2, lollipopASXL1)
   
-write_delim(x = lollipop, path = "../data/lollipopPlot.maf", delim = "\t")
+#write_delim(x = lollipop, path = "../data/lollipopPlot.maf", delim = "\t")
 
-lollipopMaf <- readMAF(maf.file = "../data/lollipopPlot.maf", if.parse.aa.pos = FALSE)
+lollipopMaf <- readMAF(maf.file = lolliMafFile, if.parse.aa.pos = FALSE)
 
 getLollipopPlot <- function(geneName) {
   plotOptions <- g3Lollipop.options(
@@ -1099,6 +1084,8 @@ cdMutationPerPatientByAgePlot <- function(variantList) {
 cdMutationPerPatientByAgePlot(candidateDriverMutations)
 ```
 
+# Experimental Analysis - Area of experimental code from testing, not intended for final use
+
 ```{r UD-samples-per-age-group}
 # Clonal Hematopoiesis with unknown drivers (Any sample with >= 3 mutations in the Putative Somatic
 # mutation list and none in the Candidate Driver mutation list)
@@ -1134,13 +1121,7 @@ ggplot(ch_udVsAll, aes(x = ageBins, y = percentageVsAll, group = 1)) +
        y = "Percent of Patients"
        ) +
   scale_y_continuous(breaks = seq(0,15,5), expand = c(0,0), limits = c(0,18)) +
-  theme(plot.title = element_text(hjust = 0.5)) +
-  annotate(geom = "text",
-           x = seq(1,12, 1),
-           y = 1.25,
-           label = paste0(ch_udAgeBins$binCount, "/", allSamplesAgeBinned$binCount),
-           size = 4,
-           )
+  theme(plot.title = element_text(hjust = 0.5))
 
 # line graph
 lmDataUd <- generateLinearModelData(ch_udVsAll$percentageVsAll, ch_udSampleAges$AGE)
@@ -1176,13 +1157,14 @@ ggplot(chVsAll, aes(x = ageBins, y = percentageVsAll, group = 1)) +
        y = "Percent of Patients"
        ) +
   scale_y_continuous(breaks = seq(0,35,5), expand = c(0,0), limits = c(0,36)) +
-  theme(plot.title = element_text(hjust = 0.5)) +
-  annotate(geom = "text",
-           x = seq(1,12, 1),
-           y = 1.25,
-           label = paste0((ch_cdAgeBins$binCount + ch_udAgeBins$binCount), "/", allSamplesAgeBinned$binCount),
-           size = 4,
-           )
+  theme(plot.title = element_text(hjust = 0.5))
+#+
+#  annotate(geom = "text",
+#           x = seq(1,12, 1),
+#           y = 1.25,
+#           label = paste0((ch_cdAgeBins$binCount + ch_udAgeBins$binCount), "/", allSamplesAgeBinned$binCount),
+#           size = 4,
+#           )
 
 # line graph
 lmDataCh <- generateLinearModelData(chVsAll$percentageVsAll, c(ch_cdSamples$AGE, ch_udSampleAges$AGE))
@@ -1249,9 +1231,11 @@ ggplot() +
            label = paste0("n=", allSamplesAgeBinned$binCount))
 ```
 
+
 ```{r}
 pie(table(sampleChDesignation$ch_designation), labels = c("other", "CH-CD"))
 ```
+
 
 ```{r CH-CD-group-data}
 ids <- c()
@@ -1269,7 +1253,7 @@ chData <- tibble(patient_id = ids,
                  variant_class = ch_cd$ExonicFunc.refGene
                  )
 
-write_delim(x = chData, path = "../data/chData.txt", delim = "\t")
+#write_delim(x = chData, path = "../data/chData.txt", delim = "\t")
 ```
 
 Use the GATK variant calls to confirm the presense of the same mutation per sample and generate
@@ -1381,6 +1365,7 @@ lmDataCd2 <- generateLinearModelData2(ch_cdVsAll2$ageBins, ch_cdVsAll2$percentag
 sampleChDesignation2$ch_designation <- factor(sampleChDesignation2$ch_designation)
 ```
 
+
 ```{r}
 getChDesignation2 <- function(sampleList) {
   designation <- c()
@@ -1471,9 +1456,6 @@ ggplot(df, aes(x = Age, y = Mean)) +
   theme(plot.title = element_text(hjust = 0.5))
 ```
 
-
-
-
 Visualize the linear model of age of patient and corresponding percentage of patients per that age group
 ```{r}
 generateLinearModelData <- function(percentageByBin, sampleAgeList) {
@@ -1559,3 +1541,56 @@ ch_cdVsAll <- tibble("ageBins" = ch_cdAgeBins$ageBins,
                      "percentageVsAll" = (ch_cdAgeBins$binCount / allSamplesAgeBinned$binCount) * 100
                      )
 ```
+
+
+# Alternative Analysis - GATK Haplotypecaller Calls 
+
+```{r}
+# GATK VCF file
+#gatkVariantCalls <- read_delim(file = gatkVcf,
+#                               delim = "\t",
+#                               col_names = TRUE,
+#                               num_threads = 2,
+#                               progress = T 
+#                               )
+
+# Rename column 1 to make it easier to interact with in data frame
+#vcfColumns <- colnames(gatkVariantCalls)
+#vcfColumns[1] <- "MUT"
+#colnames(gatkVariantCalls) <- vcfColumns
+
+# Find and remove the extra header rows from concatinating the VCF files together
+#gatkVariantCalls <- gatkVariantCalls[-which(gatkVariantCalls$MUT == "#MUT"),]
+
+# Remove any calls for the samples with below 20 mean coverage
+#gatkVariantCalls <- gatkVariantCalls %>%
+#  filter(!SAMPLE %in% samplesToRemove$`#SAMPLE`)
+
+#gatkVariantCalls <- gatkVariantCalls %>%
+#  filter(Func.refGene %in% c("exonic",
+#                             "splicing",
+#                             "exonic;splicing"
+#                            )
+#         )
+
+# GATK
+# QUAL filter
+#gatkVariantCalls <- gatkVariantCalls %>%
+#  filter(as.numeric(QUAL) > 90)
+
+# Mutation type fiter
+#gatkVariantCalls <- gatkVariantCalls %>%
+#  filter(ExonicFunc.refGene %in% c("frameshift insertion", "frameshift deletion",
+#                                   "stopgain", "stoploss", "nonsynonymous SNV")
+#         )
+
+# Remove calls with a VAF above 1 and below 0.01
+#gatkVariantCalls <- gatkVariantCalls %>%
+#  filter(FREQ < 1.0 & FREQ > 0.01)
+
+# GATK filter
+#gatkVariantCalls <- gatkVariantCalls %>%
+#  filter(FREQ < 0.50)
+```
+
+
