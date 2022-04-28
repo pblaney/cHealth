@@ -1,2 +1,7 @@
 data/filters/SM-hg38.bed filter=lfs diff=lfs merge=lfs -text
 data/lofreqVariantCalls.RData filter=lfs diff=lfs merge=lfs -text
+data/lcrVariantCalls.RData filter=lfs diff=lfs merge=lfs -text
+data/hwVariantCalls.RData filter=lfs diff=lfs merge=lfs -text
+data/ecVariantCalls.RData filter=lfs diff=lfs merge=lfs -text
+data/sdVariantCalls.RData filter=lfs diff=lfs merge=lfs -text
+data/smVariantCalls.RData filter=lfs diff=lfs merge=lfs -text
